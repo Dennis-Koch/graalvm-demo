@@ -1,0 +1,329 @@
+name: 'Ambeth HelloWorld Service'
+on: [ push ]
+env:
+  APP_NAME: "ambeth-helloworld"
+  APP_DISPLAY_NAME: "Ambeth HelloWorld Service"
+  GITHUB_TOKEN: "${{ secrets.GITHUB_TOKEN }}"
+  JAVA_VERSION: "21"
+  MAVEN_VERSION: "3.9.6"
+  ARTIFACTORY_USER: ${{ secrets.ARTIFACTORY_USER }}
+  ARTIFACTORY_PW: ${{ secrets.ARTIFACTORY_PW }}
+  MAVEN_CLI_OPTS: "-s settings.xml --batch-mode --errors --fail-at-end --show-version -DinstallAtEnd=true -DdeployAtEnd=true -Dorg.slf4j.simpleLogger.log.org.apache.maven.cli.transfer.Slf4jMavenTransferListener=warn"
+  CODE_PATHS: ".github/** src/** pom.xml Dockerfile"
+jobs:
+  initialize-ambeth-helloworld:
+    name: Initialize Ambeth HelloWorld
+    runs-on: [ ubuntu-latest ]
+    outputs:
+      code-changed: ${{ steps.code-changed.outputs.changed }}
+    steps:
+      - name: 'Checkout'
+        uses: actions/checkout@v3
+        with:
+          fetch-depth: 100
+  initialize-spring-ambeth-helloworld:
+    name: Initialize Spring Ambeth HelloWorld
+    runs-on: [ ubuntu-latest ]
+    outputs:
+      code-changed: ${{ steps.code-changed.outputs.changed }}
+    steps:
+      - name: 'Checkout'
+        uses: actions/checkout@v3
+        with:
+          fetch-depth: 100
+  verify:
+    name: Maven verify
+    runs-on: [ ubuntu-latest ]
+    needs: [ initialize-ambeth-helloworld ]
+    steps:
+      - name: 'Checkout'
+        uses: actions/checkout@v3
+      - name: 'Java: Setup'
+        uses: actions/setup-java@v3
+        with:
+          java-version: ${{ env.JAVA_VERSION }}
+          distribution: 'adopt'
+      - name: Set up Maven
+        uses: stCarolas/setup-maven@v4.5
+        with:
+          maven-version: ${{ env.MAVEN_VERSION }}
+      - name: 'Maven: verify'
+        run: mvn verify $MAVEN_CLI_OPTS
+  testAot:
+    name: AOT Tests
+    runs-on: [ ubuntu-latest ]
+    needs: [ initialize-ambeth-helloworld ]
+    steps:
+      - name: 'Checkout'
+        uses: actions/checkout@v3
+      - name: 'Java: Setup'
+        uses: actions/setup-java@v3
+        with:
+          java-version: ${{ env.JAVA_VERSION }}
+          distribution: 'adopt'
+      - name: Set up Maven
+        uses: stCarolas/setup-maven@v4.5
+        with:
+          maven-version: ${{ env.MAVEN_VERSION }}
+      - name: 'Maven: verify'
+        run: |
+          mvn clean test spring-boot:process-test-aot $MAVEN_CLI_OPTS
+          mvn -PskipNotNativeTests "-Dspring.aot.enabled=true" test $MAVEN_CLI_OPTS
+  prepare:
+    name: 'Prepare GraalVM-metadata'
+    runs-on: [ ubuntu-latest ]
+    needs: [ initialize-spring-ambeth-helloworld ]
+    if: ${{ github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master' || github.ref == 'refs/heads/develop' || startsWith(github.ref, 'refs/tags/') }}
+    steps:
+      - name: 'Checkout'
+        uses: actions/checkout@v3
+      - name: 'GraalVM: Setup'
+        uses: graalvm/setup-graalvm@v1
+        with:
+          java-version: ${{ env.JAVA_VERSION }}
+      - name: Set up Maven
+        uses: stCarolas/setup-maven@v4.5
+        with:
+          maven-version: ${{ env.MAVEN_VERSION }}
+      - name: 'Generate and merge metadata'
+        run: |
+          mvn -Pnative-image-agent test $MAVEN_CLI_OPTS # prepare native image-metadata
+          mv src/main/resources/META-INF/native-image ./
+          zip -r -j metadata-artifact.zip native-image
+      - name: Save project with metadata
+        uses: actions/upload-artifact@v3
+        with:
+          name: metadata-artifact
+          path: metadata-artifact.zip
+  package:
+    name: 'Native Image Compile'
+    runs-on: [ ubuntu-latest ]
+    needs: [ verify, testAot, prepare ]
+    if: ${{ github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master' || github.ref == 'refs/heads/develop' || startsWith(github.ref, 'refs/tags/') }}
+    steps:
+      - name: 'Checkout'
+        uses: actions/checkout@v3
+      - name: 'Java: Setup'
+        uses: actions/setup-java@v3
+        with:
+          java-version: ${{ env.JAVA_VERSION }}
+          distribution: 'adopt'
+      - name: Set up Maven
+        uses: stCarolas/setup-maven@v4.5
+        with:
+          maven-version: ${{ env.MAVEN_VERSION }}
+      - name: Download artifact
+        uses: actions/download-artifact@v3
+        with:
+          name: metadata-artifact
+      - name: 'Build Docker-Image'
+        run: |
+          mkdir -p ./src/main/resources/META-INF/native-image
+          unzip -o metadata-artifact.zip -d ./src/main/resources/META-INF/native-image
+          mvn -Pnative -DskipTests spring-boot:build-image $MAVEN_CLI_OPTS
+          docker build -f Dockerfile-native -t $APP_NAME:latest .
+      - name: Save Docker image artifact
+        run: docker save -o target-artifact.tar $APP_NAME:latest
+      - name: Upload artifact
+        uses: actions/upload-artifact@v3
+        with:
+          name: target-artifact
+          path: target-artifact.tar
+  dev-latest:
+    name: 'DEV: Publish latest'
+    runs-on: [ ubuntu-latest ]
+    needs: [ package ]
+    if: ${{ github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master' || github.ref == 'refs/heads/develop' || startsWith(github.ref, 'refs/tags/') }}
+    env:
+      DEV_AWS_ACCESS_KEY_ID: ${{ secrets.DEV_AWS_ACCESS_KEY_ID }}
+      DEV_AWS_SECRET_ACCESS_KEY: ${{ secrets.DEV_AWS_SECRET_ACCESS_KEY }}
+      AWS_REGION: eu-central-1
+    steps:
+      - name: 'Checkout'
+        uses: actions/checkout@v3
+      - name: 'DEV Configure AWS credentials'
+        uses: aws-actions/configure-aws-credentials@v2
+        with:
+          aws-access-key-id: ${{ secrets.DEV_AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.DEV_AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+      - name: Download artifact
+        uses: actions/download-artifact@v3
+        with:
+          name: target-artifact
+      - name: Load Docker image
+        run: docker load -i target-artifact.tar
+      - name: 'DEV push latest'
+        id: login-dev-ecr
+        uses: aws-actions/amazon-ecr-login@v1
+        with:
+          mask-password: 'true'
+      - name: DEV Build and tag the image
+        id: build-dev-image
+        env:
+          ECR_REGISTRY: ${{ steps.login-dev-ecr.outputs.registry }}
+          ARTIFACTORY_USER: ${{ env.ARTIFACTORY_USER }}
+          ARTIFACTORY_PW: ${{ env.ARTIFACTORY_PW }}
+        run: |
+          docker tag $APP_NAME:latest $ECR_REGISTRY/$APP_NAME:latest
+          docker push $ECR_REGISTRY/$APP_NAME:latest
+  dev-tag:
+    name: 'DEV: Publish tag'
+    runs-on: [ ubuntu-latest ]
+    needs: [ package ]
+    if: ${{ startsWith(github.ref, 'refs/tags/') }}
+    env:
+      DEV_AWS_ACCESS_KEY_ID: ${{ secrets.DEV_AWS_ACCESS_KEY_ID }}
+      DEV_AWS_SECRET_ACCESS_KEY: ${{ secrets.DEV_AWS_SECRET_ACCESS_KEY }}
+      AWS_REGION: eu-central-1
+    steps:
+      - name: 'Checkout'
+        uses: actions/checkout@v3
+      - name: Set some vars
+        id: vars
+        run: |
+          calculatedTag=$(git describe --tags --abbrev=0 ${{ github.sha }} 2>/dev/null || true)
+          echo "GIT_TAG=$calculatedTag" >> $GITHUB_OUTPUT
+      - name: 'DEV Configure AWS credentials'
+        uses: aws-actions/configure-aws-credentials@v2
+        with:
+          aws-access-key-id: ${{ secrets.DEV_AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.DEV_AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+      - name: Download artifact
+        uses: actions/download-artifact@v3
+        with:
+          name: target-artifact
+      - name: Load Docker image
+        run: docker load -i target-artifact.tar
+      - name: 'DEV: Publish tag'
+        id: login-dev-ecr
+        uses: aws-actions/amazon-ecr-login@v1
+        with:
+          mask-password: 'true'
+      - name: DEV Build and tag the image
+        id: build-dev-image
+        env:
+          ECR_REGISTRY: ${{ steps.login-dev-ecr.outputs.registry }}
+          ARTIFACTORY_USER: ${{ env.ARTIFACTORY_USER }}
+          ARTIFACTORY_PW: ${{ env.ARTIFACTORY_PW }}
+        run: |
+          docker tag $APP_NAME:latest $ECR_REGISTRY/$APP_NAME:${{ steps.vars.outputs.GIT_TAG }}
+          docker push $ECR_REGISTRY/$APP_NAME:${{ steps.vars.outputs.GIT_TAG }}
+  int-tag:
+    name: 'INT: Publish tag'
+    runs-on: [ ubuntu-latest ]
+    needs: [ package ]
+    if: ${{ startsWith(github.ref, 'refs/tags/')}}
+    env:
+      INT_AWS_ACCESS_KEY_ID: ${{ secrets.INT_AWS_ACCESS_KEY_ID }}
+      INT_AWS_SECRET_ACCESS_KEY: ${{ secrets.INT_AWS_SECRET_ACCESS_KEY }}
+      AWS_REGION: eu-central-1
+    steps:
+      - name: 'Checkout'
+        uses: actions/checkout@v3
+      - name: Set some vars
+        id: vars
+        run: |
+          calculatedTag=$(git describe --tags --abbrev=0 ${{ github.sha }} 2>/dev/null || true)
+          echo "GIT_TAG=$calculatedTag" >> $GITHUB_OUTPUT
+      - name: 'INT Configure AWS credentials'
+        uses: aws-actions/configure-aws-credentials@v2
+        with:
+          aws-access-key-id: ${{ secrets.INT_AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.INT_AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+      - name: Download artifact
+        uses: actions/download-artifact@v3
+        with:
+          name: target-artifact
+      - name: Load Docker image
+        run: docker load -i target-artifact.tar
+      - name: 'INT: Publish tag'
+        id: login-int-ecr
+        uses: aws-actions/amazon-ecr-login@v1
+        with:
+          mask-password: 'true'
+      - name: INT Build and tag the image
+        id: build-int-image
+        env:
+          ECR_REGISTRY: ${{ steps.login-int-ecr.outputs.registry }}
+          ARTIFACTORY_USER: ${{ env.ARTIFACTORY_USER }}
+          ARTIFACTORY_PW: ${{ env.ARTIFACTORY_PW }}
+        run: |
+          docker tag $APP_NAME:latest $ECR_REGISTRY/$APP_NAME:${{ steps.vars.outputs.GIT_TAG }}
+          docker push $ECR_REGISTRY/$APP_NAME:${{ steps.vars.outputs.GIT_TAG }}
+  prod-tag:
+    name: 'PROD: Publish tag'
+    runs-on: [ ubuntu-latest ]
+    needs: [ package ]
+    if: ${{ startsWith(github.ref, 'refs/tags/')}}
+    env:
+      prod_AWS_ACCESS_KEY_ID: ${{ secrets.prod_AWS_ACCESS_KEY_ID }}
+      prod_AWS_SECRET_ACCESS_KEY: ${{ secrets.prod_AWS_SECRET_ACCESS_KEY }}
+      AWS_REGION: eu-central-1
+    steps:
+      - name: 'Checkout'
+        uses: actions/checkout@v3
+      - name: Set some vars
+        id: vars
+        run: |
+          calculatedTag=$(git describe --tags --abbrev=0 ${{ github.sha }} 2>/dev/null || true)
+          echo "GIT_TAG=$calculatedTag" >> $GITHUB_OUTPUT
+      - name: 'PROD Configure AWS credentials'
+        uses: aws-actions/configure-aws-credentials@v2
+        with:
+          aws-access-key-id: ${{ secrets.prod_AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.prod_AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+      - name: Download artifact
+        uses: actions/download-artifact@v3
+        with:
+          name: target-artifact
+      - name: Load Docker image
+        run: docker load -i target-artifact.tar
+      - name: 'PROD: Publish tag'
+        id: login-prod-ecr
+        uses: aws-actions/amazon-ecr-login@v1
+        with:
+          mask-password: 'true'
+      - name: PROD Build and tag the image
+        id: build-prod-image
+        env:
+          ECR_REGISTRY: ${{ steps.login-prod-ecr.outputs.registry }}
+          ARTIFACTORY_USER: ${{ env.ARTIFACTORY_USER }}
+          ARTIFACTORY_PW: ${{ env.ARTIFACTORY_PW }}
+        run: |
+          docker tag $APP_NAME:latest $ECR_REGISTRY/$APP_NAME:${{ steps.vars.outputs.GIT_TAG }}
+          docker push $ECR_REGISTRY/$APP_NAME:${{ steps.vars.outputs.GIT_TAG }}
+  security-check:
+    name: Security Check
+    runs-on: [ ubuntu-latest ]
+    steps:
+      - name: 'Checkout'
+        uses: actions/checkout@v3
+      - name: 'Java: Setup'
+        uses: actions/setup-java@v3
+        with:
+          java-version: ${{ env.JAVA_VERSION }}
+          distribution: 'adopt'
+      - name: Set up Maven
+        uses: stCarolas/setup-maven@v4.5
+        with:
+          maven-version: ${{ env.MAVEN_VERSION }}
+      - name: 'Maven: dependency-check'
+        run: mvn dependency-check:check -P security -Ddownloader.quick.query.timestamp=false $MAVEN_CLI_OPTS
+      - name: 'Security-Report: upload'
+        uses: actions/upload-artifact@v3
+        with:
+          name: security-check-artifact
+          path: target/dependency-check-report.html
+  cleanup:
+    name: 'Cleanup docker-cache'
+    runs-on: [ ubuntu-latest ]
+    if: always()
+    needs: [ dev-latest, dev-tag, int-tag, prod-tag ]
+    steps:
+      - name: Cleanup docker-cache
+        run: |
+          docker system prune -a -f
